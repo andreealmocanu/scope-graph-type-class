@@ -142,17 +142,19 @@ createDecls :: (Functor f, Exists Ty < f, Equals Ty < f, Error String < f, Scope
 createDecls sc decls = do 
   do catMaybes <$> mapM (create sc) decls
   where
-    create sc (VarT name typeSch) = do
-      t <- exists
-      sink sc D $ Decl name t
-      return $ Just (sc, t, name)
+    -- create sc (Method name pty rty) = do
+    --   sink sc D $ MethodSignature name pty rty
+    --   return Nothing
     create sc (ClassT name vars methods) = do 
-      t <- exists 
       s' <- new 
       sink sc D $ ClassD name s'
-      edge sc P s'
-      return $ Just (sc, t, methods) 
-    create _ _ = return Nothing
+      edge s' P sc
+      createDecls s' methods 
+      return Nothing
+    -- create sc (InsT tys tcls fs) = do 
+      -- s' <- new
+      -- sink s'  
+      -- edge s' I sc 
 
 tcProg :: (Functor f, Exists Ty < f, Equals Ty < f, Error String < f, Scope Sc Label Decl < f) => ProgT -> Sc -> Free f ()
 tcProg p sc = do 
