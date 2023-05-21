@@ -1,9 +1,19 @@
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE FlexibleContexts #-}
+
 module TypeCheck where 
 
 import Data.Functor ( (<&>) )
 import Data.Regex
+import Data.Term 
 
 import Free
+import Free.Logic.Exists
+import Free.Logic.Generalize 
+import Free.Logic.Equals
 import Free.Scope hiding (edge, new, sink)
 import qualified Free.Scope as S (edge, new, sink)
 import Free.Error
@@ -11,6 +21,7 @@ import Syntax
 import Control.Monad
 import Control.Applicative ((<|>))
 import qualified Data.Map as Map
+import Data.Maybe
 
 ----------------------------
 -- Scope Graph Parameters --
@@ -19,12 +30,13 @@ import qualified Data.Map as Map
 data Label
   = P -- Lexical Parent Label
   | TC -- Type Class Label
+  | I -- instance declaration
   | D -- Declaration
   | TyV 
   deriving (Show, Eq)
 
 data Decl
-  = Decl String Type   -- Variable declaration
+  = Decl String Ty   -- Variable declaration
   | ClassD String Sc   -- Type Class declaration
   | InstD [Type] Sc    -- Instance declaration
   | MethodSignature String [String] String -- name, parameters and return type
@@ -35,10 +47,12 @@ data Decl
 instance Show Decl where
   show (Decl x t) = x ++ " : " ++ show t
 
-projTy :: Decl -> Type
+projTy :: Decl -> Ty
 projTy (Decl _ t) = t
 
 -- Scope Graph Library Convenience
+wildcard = Atom P `Pipe` Atom D
+
 edge :: Scope Sc Label Decl < f => Sc -> Label -> Sc -> Free f ()
 edge = S.edge @_ @Label @Decl
 
@@ -60,23 +74,6 @@ pShortest p1 p2 = lenRPath p1 < lenRPath p2
 matchDecl :: String -> Decl -> Bool
 matchDecl x (Decl x' _) = x == x'
 
--- match a given Var with a given String and return the Var's type
--- matchVar :: DeclT -> String -> Maybe Type
--- matchVar (Var x t) s = if x == s then Just t else Nothing
-
--- extract the declaration from a given scope
--- projDecl :: Sc -> String -> Maybe Decl
--- projDecl s x = do
---   d <- proj s x
---   case d of
---     DeclT t -> Just $ Decl x t
---     _       -> Nothing
-
--- projDecl :: DeclT -> Maybe Decl
--- projDecl (Var _ _) = Nothing
--- projDecl (InsT _ _ decls) = foldr ((<|>) . projDecl) Nothing decls
--- projDecl (ClassT _ _ decls) = foldr ((<|>) . projDecl) Nothing decls
-
 ------------------
 -- Type Checker --
 ------------------
@@ -85,93 +82,195 @@ matchDecl x (Decl x' _) = x == x'
 tc :: ( Functor f
       -- List of 'capabilities' of type checker
       -- No need for inference: Disable parts related to first-order unification and generalization
-      -- , Exists Type < f                   -- Introduce new meta-variables
-      -- , Equals Type < f                   -- First-order unification
-      -- , Generalize [Int] Type < f         -- HM-style generalization
+      , Exists Ty < f                   -- Introduce new meta-variables
+      , Equals Ty < f                   -- First-order unification
+      , Generalize [Int] Ty < f         -- HM-style generalization
       , Error String < f                  -- Emit String errors
       , Scope Sc Label Decl < f           -- Scope graph operations
       )
-   => Expr -> Sc -> Free f Type
+   => Expr -> Sc -> Ty -> Free f ()
 
-tc (Num _) _ = return NumT
-tc (Bool _) _ = return BoolT 
-tc (Plus e1 e2) sc = do
-  t1 <- tc e1 sc
-  t2 <- tc e2 sc
-  case (t1, t2) of
-    (NumT, NumT) -> return NumT
-    (t1', NumT)  -> err $ "Expected left operand of plus expression to have type 'num', got '" ++ 
-                          show t1' ++ "'"
-    (NumT, t2')  -> err $ "Expected right operand of plus expression to have type 'num', got '" ++ 
-                          show t2' ++ "'"
-    (t1', t2')   -> err $ "Expected operands of plus expression to have type 'num', got '" ++ 
-                          show t1' ++ "' and '" ++
-                          show t2' ++ "'"
-tc (App e1 e2) sc = do
-  t1 <- tc e1 sc
-  t2 <- tc e2 sc
-  case t1 of
-    (FunT t t') | t == t2 -> return t'
-    (FunT t _)            -> err $ "Expected argument of type '" ++ show t ++ "' got '" ++ show t2 ++ "'"
-    t                     -> err $ "Expected arrow type, got '" ++ show t ++ "'"
-tc (Abs x t e) s = do
-  s' <- new -- create new scope node
-  edge s' P s
-  sink s' D $ Decl x t
-  t' <- tc e s'
-  return $ FunT t t'
-tc (Ident x) s = do
-  ds <- query s re pShortest (matchDecl x) <&> map projTy
-  case ds of
-    []  -> err "No matching declarations found"
-    [t] -> return t
-    _   -> err "BUG: Multiple declarations found" -- cannot happen for STLC
-tc (Let (name, ty, e) body) s = do 
-  s' <- new 
-  edge s' P s 
-  sink s' D $ Decl name ty 
-  tc e s' 
--- tc (Let (name, ty, e) body) s = do 
---   s' <- new 
---   edge s' P s 
---   sink s' D $ Decl name ty 
---   t' <- tc e s'
---   sink s' D $ Var name (Forall [] ty) -- add declaration for variable in scope
---   t'' <- tc body s'
---   return t''
+tc (Num _) _ t = equals t numT
+tc (Bool _) _ t = equals t boolT 
+tc (Plus e1 e2) sc t = do
+  equals t numT
+  tc e1 sc numT 
+  tc e2 sc numT
+tc (App e1 e2) sc t = do --e1 is function, e2 argument
+  s <- exists -- arg type
+  tc e1 sc (funT s t)
+  tc e2 sc s
+tc (Abs x e) sc t = do
+  s <- exists 
+  t' <- exists
+  sc' <- new 
+  edge sc' P sc
+  sink sc' D $ Decl x s
+  tc e sc' t' 
+  equals t (funT s t')
+tc (Ident x) sc t = do
+  ds <- query 
+          sc 
+          (Star (Atom P) `Dot` Atom D)
+          (\ p1 p2 -> lenRPath p1 < lenRPath p2)
+          (\ (Decl y _) -> x == y) 
+  if length ds == 1 
+    then do 
+      dt <- instantiate @[Int] (projTy (head ds))
+      equals t dt 
+    else if null ds 
+        then err $ "Query failed: unbound identifier " ++ x 
+        else err $ "Query yielded ambiguous binders for " ++ x 
+  -- query s re pShortest (matchDecl x) <&> map projTy
+tc (Let name e body) sc t = do 
+  s <- exists -- introduce new type variable? represents unknown types
+  tc e sc s 
+  st <- inspect s -- get inferred type of term represented by type variable s?
+  ds <- query
+          sc 
+          (Star wildcard `Dot` Atom D)
+          (\ p1 p2 -> lenRPath p1 < lenRPath p2)
+          (\ (_ :: Decl) -> True)
+  st' <- generalize (concatMap (\ (Decl _ t) -> fv t) ds) st 
+  sc' <- new 
+  edge sc' P sc 
+  sink sc' D (Decl name st')
+  tc body sc' t  
 
-tcClsInst :: ( Functor f
-              , Error String < f
-              , Scope Sc Label Decl < f
-              )
-            => DeclT -> Sc -> Free f Type 
-tcClsInst (ClassT className typeParams decls) s = do 
-  -- add new scope for the class
-  classSc <- new 
-  -- add the class name to the scope
-  --sink s D $ ClassD className classSc 
-  sink s D $ ClassD className classSc
-  edge classSc P s 
-  -- still need edge between class declaration and class scope(?)
-  sink classSc D $ ClassD className classSc
-  sink classSc D $ TypeVarD typeParams --change label to TyV
-  return (TyClass className)
-tcClsInst (Var name tScheme@(Forall paramTy returnTy)) s = do 
-  sink s D $ MethodSignature name paramTy returnTy 
-  return (TyVar "example")
+-- create LHS here
+createDecls :: (Functor f, Exists Ty < f, Equals Ty < f, Error String < f, Scope Sc Label Decl < f) => Sc -> [DeclT] -> Free f [(Sc, Ty, Expr)]
+createDecls sc decls = do 
+  do catMaybes <$> mapM (create sc) decls
+  where
+    create sc (VarT name typeSch) = do
+      t <- exists
+      sink sc D $ Decl name t
+      return $ Just (sc, t, name)
+    create sc (ClassT name vars methods) = do 
+      t <- exists 
+      s' <- new 
+      sink sc D $ ClassD name s'
+      edge sc P s'
+      return $ Just (sc, t, methods) 
+    create _ _ = return Nothing
 
-tcClsInst _ s = err "No matching declaration found"
+tcProg :: (Functor f, Exists Ty < f, Equals Ty < f, Error String < f, Scope Sc Label Decl < f) => ProgT -> Sc -> Free f ()
+tcProg p sc = do 
+  decls <- createDecls 
+  mapM_ (\(scope, ty, expr) -> tc expr scope ty) decls
+
+  -- edge s' P s 
+  -- sink s' D $ Decl name ty 
+  -- t' <- tc e s'
+  -- sink s' D $ Var name (Forall [] ty) -- add declaration for variable in scope
+  -- t'' <- tc body s'
+  -- return t''
+
+-- tcClsInst :: ( Functor f
+--       , Exists Ty < f                   -- Introduce new meta-variables
+--       , Equals Ty < f                   -- First-order unification
+--       , Generalize [Int] Ty < f         -- HM-style generalization
+--       , Error String < f                  -- Emit String errors
+--       , Scope Sc Label Decl < f           -- Scope graph operations
+--       )
+--    => DeclT -> Sc -> Ty -> Free f ()
+-- tcClsInst (ClassT className typeParams decls) s t = do 
+--   s' <- exists
+
+--   classSc <- new 
+--   -- add the class name to the scope
+--   --sink s D $ ClassD className classSc 
+--   sink s D $ ClassD className classSc
+--   edge classSc P s 
+--   -- still need edge between class declaration and class scope(?)
+--   sink classSc D $ ClassD className classSc
+--   sink classSc D $ TypeVarD typeParams --change label to TyV
+  -- return (TyClass className)
+-- tcClsInst (VarT name tScheme@(Forall paramTy returnTy)) s = do 
+--   sink s D $ MethodSignature name paramTy returnTy 
+--   return (TyVar "example")
+-- tcClsInst _ s t = err "No matching declaration found"
 
 -- Tie it all together
-runTC :: Expr -> Either String (Type, Graph Label Decl)
-runTC e = un
+runTC :: Expr -> Either String (Graph Label Decl, Ty)
+runTC e =
+  let x = un
         $ handle hErr
-        $ handle_ hScope (tc e 0) emptyGraph
+        $ flip (handle_ hScope) emptyGraph
+        $ flip (handle_ hEquals) Map.empty
+        $ flip (handle_ hExists) 0
+        $ handle (hGeneralize fv schemeT genT)
+        (do t <- exists
+            tc e 0 t
+        :: Free ( Generalize [Int] Ty
+                + Exists Ty
+                + Equals Ty
+                + Scope Sc Label Decl
+                + Error String
+                + Nop )
+                () )
+  in case x of
+    Left s                                   -> Left s
+    Right (Left (UnificationError t1 t2), _) -> Left $ "Unification error: " ++ show t1 ++ " != " ++ show t2
+    Right (Right (_, u), sg)                  -> 
+      let t' = inspectVar u 0
+          vs = fv t'
+       in Right (sg, schemeT vs t')
+  where
+    genT t = do
+      t <- inspect t
+      case t of
+        Term "∀" ts -> 
+            let gens = init ts
+                t' = last ts 
+            in do
+              substs <- mapM (\case
+                                Const i -> do y <- exists; return (i,y)
+                                _       -> err "Bad quantifier" 
+                             )
+                        gens
+              return $ substsIn substs t'
+        _ -> return t
 
-runTCD :: DeclT -> Either String (Type, Graph Label Decl)
-runTCD decl = un 
-        $ handle hErr 
-        $ handle_ hScope (tcClsInst decl 0) emptyGraph
+runTCD :: DeclT -> Either String (Graph Label Decl, Ty)
+runTCD decl =
+  let x = un
+        $ handle hErr
+        $ flip (handle_ hScope) emptyGraph
+        $ flip (handle_ hEquals) Map.empty
+        $ flip (handle_ hExists) 0
+        $ handle (hGeneralize fv schemeT genT)
+        (do t <- exists
+            tcClsInst decl 0 t
+        :: Free ( Generalize [Int] Ty
+                + Exists Ty
+                + Equals Ty
+                + Scope Sc Label Decl
+                + Error String
+                + Nop )
+                () )
+  in case x of
+    Left s                                   -> Left s
+    Right (Left (UnificationError t1 t2), _) -> Left $ "Unification error: " ++ show t1 ++ " != " ++ show t2
+    Right (Right (_, u), sg)                  -> 
+      let t' = inspectVar u 0
+          vs = fv t'
+       in Right (sg, schemeT vs t')
+  where
+    genT t = do
+      t <- inspect t
+      case t of
+        Term "∀" ts -> 
+            let gens = init ts
+                t' = last ts 
+            in do
+              substs <- mapM (\case
+                                Const i -> do y <- exists; return (i,y)
+                                _       -> err "Bad quantifier" 
+                             )
+                        gens
+              return $ substsIn substs t'
+        _ -> return t
 
 
 -- Var className $ Forall (map TyVar typeParams) (TyClass className (map TyVar typeParams))
