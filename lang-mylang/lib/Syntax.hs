@@ -13,17 +13,23 @@ data Expr
   | Plus Expr Expr -- plus
   | App Expr Expr -- function application
   | Ident String -- identifier
-  | Abs String Expr -- lambdas
+  | Abs String Expr -- lambdas; param, (omitted) type, body
   | Let String Expr Expr 
+  | IdentFun String Expr -- function declaration identifier; name of function to be applied and argument(s)
   -- let s be e1 in e2 
   -- let ((bounds)) body, where bounds: name, type, expr
   -- | If Expr Expr Expr -- if then else
   -- | ClassDecl String [(String, Type)] -- class name, list of method names and their types
   deriving (Eq, Show)
 
-data DeclT = ClassT String [String] [DeclT] -- name, type variables, methods
-      | InsT [Ty] Ty [DeclT] -- types that are instantiates, type class, methods
-      | VarT String TypeScheme
+data DeclT = ClassDecl String [Ty] [DeclT] -- name, type variables, methods
+      -- ClassT String [String] [DeclT]
+      | InstDecl Ty String [DeclT] -- types that are instantiates, type class name 
+       -- I don't need methods' implementation for now 
+      -- used to be Ty as the typeclass, but do I really need a type class type?
+      | Method String Ty Ty -- method signature: name, param types (only one parameter for now), return type
+      | FunDecl String String DeclT Expr -- function declaration: name, parameter, method signature, implementation
+      -- VarT String TypeScheme
     deriving (Show, Eq)
 
 data TypeScheme = TypeScheme [Int] Ty 
@@ -35,7 +41,11 @@ toTy :: Type -> Ty
 toTy NumT = numT
 toTy BoolT = boolT
 toTy (FunT f t) = funT (toTy f) (toTy t)
+  -- funT param (toTy t)
+  -- where 
+  --   param = map toTy f
 toTy (TyClass name) = typeclsT name
+toTy (TyVar a) = typeVar a
 
 instance Show TypeScheme where
   show (TypeScheme [] t) = show t
@@ -50,21 +60,31 @@ sfv (TypeScheme vars t) = fv t \\ vars
 
 instance Show Ty where
   show (Const i) = "α" ++ show i
-  show (Var i) = "α" ++ show i
+  show (Var i) = "αVar" ++ show i
   -- show (Term "∀" ts) = "(∀ " ++ unwords (map show (init ts)) ++ ". " ++ show (last ts) ++ ")"
   show (Term "->" [t1, t2]) = show t1 ++ " -> " ++ show t2
   show (Term "Num" []) = "Num"
   show (Term "Bool" []) = "Bool"
-  show (Term "TypeClass" []) = "TypeClass"
-  show _ = "undefined term"
+  show (Term "TypeClass" name) = "TypeClass " ++ show name
+  show (Term "TypeVariable" name) = "Type Variable " ++ show name
+  show _ = "undefined term "
   -- show (Term )
   -- show (Term f ts) = "(" ++ f ++ unwords (map show ts) ++ ")"
 
 -- type construction
+numT :: Term c
 numT = Term "Num" []
+boolT :: Term c
 boolT = Term "Bool" []
+-- funT :: [Term c] -> Term c -> Term c
+-- funT p r = Term "->" (p ++ [r])
+funT :: Term c -> Term c -> Term c 
 funT p r = Term "->" [p, r]
-typeclsT name = Term ("TypeClass" ++ name) []
+typeclsT :: [Char] -> Term c
+typeclsT name = Term ("TypeClass " ++ name) []
+typeVar :: [Char] -> Term c
+typeVar name = Term ("TypeVariable " ++ name) []
+schemeT :: [c] -> Term c -> Term c
 schemeT xs t | not (null xs) = Term "∀" (map Const xs ++ [t])
              | otherwise = t
 
@@ -72,7 +92,7 @@ data Type = NumT
     | BoolT
     | FunT Type Type
     | TyVar String -- type variable 
-    | TyCon String [Type] -- type constructor
+    -- | TyCon String [Type] -- type constructor
     | TyClass String --[Type] -- type classes
     deriving (Eq, Show)
 
